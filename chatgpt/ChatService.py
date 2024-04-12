@@ -39,21 +39,21 @@ async def stream_response(response, model, max_tokens):
                     delta = {"role": "assistant", "content": moderation_message}
                     finish_reason = "moderation"
                     end = True
-                elif chunk_old_data.get("message").get("status") == "in_progress" or chunk_old_data.get("message").get("metadata").get("finish_details", {}):
+                elif chunk_old_data.get("message").get("status") == "in_progress":
                     content = chunk_old_data["message"]["content"]["parts"][0]
                     if not content:
                         delta = {"role": "assistant", "content": ""}
                     else:
                         delta = {"content": content[len_last_content:]}
                     len_last_content = len(content)
-                    if chunk_old_data["message"]["metadata"].get("finish_details", {}):
-                        delta = {}
-                        finish_reason = "stop"
-                        end = True
                     if completion_tokens == max_tokens:
                         delta = {}
                         finish_reason = "length"
                         end = True
+                elif chunk_old_data.get("message").get("metadata").get("finish_details"):
+                    delta = {}
+                    finish_reason = "stop"
+                    end = True
                 else:
                     continue
                 chunk_new_data = {
@@ -163,7 +163,10 @@ def api_messages_to_chat(api_messages):
 
 class ChatService:
     def __init__(self, data, access_token=None):
-        self.s = httpx.AsyncClient(proxies=random.choice(proxy_url_list), timeout=30, verify=False)
+        if proxy_url_list:
+            self.s = httpx.AsyncClient(timeout=30, verify=False, proxies=random.choice(proxy_url_list))
+        else:
+            self.s = httpx.AsyncClient(timeout=30, verify=False)
         self.free35_base_url = random.choice(free35_base_url_list)
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0"
         self.access_token = access_token
@@ -200,7 +203,20 @@ class ChatService:
         try:
             r = await self.s.post(url, headers=headers, json={})
             if r.status_code == 200:
-                self.chat_token = r.json().get('token')
+                resp = r.json()
+
+                arkose = resp.get('arkose', {})
+                arkose_required = arkose.get('required')
+                if arkose_required:
+                    arkose_dx = arkose.get("dx")
+                    raise HTTPException(status_code=403, detail="Arkose required")
+
+                turnstile = resp.get('turnstile', {})
+                turnstile_required = turnstile.get('required')
+                if turnstile_required:
+                    raise HTTPException(status_code=403, detail="Turnstile required")
+
+                self.chat_token = resp.get('token')
                 if not self.chat_token:
                     raise HTTPException(status_code=502, detail=f"Failed to get chat token: {r.text}")
                 return self.chat_token
@@ -219,6 +235,7 @@ class ChatService:
         except HTTPException as e:
             raise HTTPException(status_code=e.status_code, detail=e.detail)
         except Exception as e:
+            Logger.error(f"Failed to request: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to request.")
 
     def prepare_send_conversation(self):
@@ -248,6 +265,7 @@ class ChatService:
         else:
             model = "text-davinci-002-render-sha"
         parent_message_id = f"{uuid.uuid4()}"
+        websocket_request_id = f"{uuid.uuid4()}"
         self.chat_request = {
             "action": "next",
             "messages": chat_messages,
@@ -261,6 +279,7 @@ class ChatService:
             "force_paragen_model_slug": "",
             "force_nulligen": False,
             "force_rate_limit": False,
+            "websocket_request_id": websocket_request_id,
         }
         if self.conversation_id:
             self.chat_request["conversation_id"] = self.conversation_id
@@ -275,20 +294,9 @@ class ChatService:
             return stream_response(r, model, self.max_tokens)
         else:
             await r.aread()
-            if "application/json" == r.headers.get("Content-Type", ""):
-                detail = r.json().get("detail", r.json())
-            else:
-                detail = r.content
-            if r.status_code != 200:
-                if r.status_code == 403:
-                    raise HTTPException(status_code=r.status_code, detail="cf-please-wait")
-                raise HTTPException(status_code=r.status_code, detail=detail)
+            await self.parse_response_content(r)
 
-    async def send_conversation(self):
-        url = f'{self.free35_base_url}/conversation'
-        model = model_proxy.get(self.model, self.model)
-        r = await self.s.send(
-            self.s.build_request("POST", url, headers=self.headers, json=self.chat_request, timeout=600), stream=False)
+    async def parse_response_content(self, r):
         if "application/json" == r.headers.get("Content-Type", ""):
             detail = r.json().get("detail", r.json())
         else:
@@ -297,5 +305,12 @@ class ChatService:
             if r.status_code == 403:
                 raise HTTPException(status_code=r.status_code, detail="cf-please-wait")
             raise HTTPException(status_code=r.status_code, detail=detail)
+
+    async def send_conversation(self):
+        url = f'{self.free35_base_url}/conversation'
+        model = model_proxy.get(self.model, self.model)
+        r = await self.s.send(
+            self.s.build_request("POST", url, headers=self.headers, json=self.chat_request, timeout=600), stream=False)
+        await self.parse_response_content(r)
         resp = r.text.split("\n")
         return await chat_response(resp, model, self.prompt_tokens, self.max_tokens)

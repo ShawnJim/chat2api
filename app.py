@@ -44,7 +44,7 @@ async def send_conversation(request: Request, token=Depends(verify_token)):
     # 发送对话
     stream = request_data.get("stream", False)
     if stream is True:
-     # 流式响应
+        # 流式响应
         return StreamingResponse(await chat_service.send_conversation_for_stream(), media_type="text/event-stream")
     else:
         # 非流式响应
@@ -53,9 +53,11 @@ async def send_conversation(request: Request, token=Depends(verify_token)):
 
 if __name__ == "__main__":
     import uvicorn
+
     log_config = uvicorn.config.LOGGING_CONFIG
     default_format = "%(asctime)s | %(levelname)s | %(message)s"
     access_format = r'%(asctime)s | %(levelname)s | %(client_addr)s: %(request_line)s %(status_code)s'
     log_config["formatters"]["default"]["fmt"] = default_format
     log_config["formatters"]["access"]["fmt"] = access_format
+
     uvicorn.run("app:app", host="0.0.0.0", port=5005)
